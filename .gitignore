@@ -1,0 +1,10 @@
+ulank6/
+*.o
+*.ko
+*.mod
+*.mod.c
+*.cmd
+.tmp_*
+*.patch.rej
+*.patch.orig
+__pycache__/

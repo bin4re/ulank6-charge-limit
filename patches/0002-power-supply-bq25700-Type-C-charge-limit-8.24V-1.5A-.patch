@@ -1,0 +1,266 @@
+From dfe6ab3ecdf47af33a0d7ff2f0d624858d5ffaa3 Mon Sep 17 00:00:00 2001
+From: bin4re <bin4re@foxmail.com>
+Date: Tue, 24 Nov 2026 21:10:47 +0800
+Subject: [PATCH 2/2] power: supply: bq25700: Type-C charge limit 8.24V/1.5A
+ with SC8886 CV latch reset
+
+---
+ drivers/power/supply/bq25700_charger.c | 145 +++++++++++++++++++++----
+ 1 file changed, 122 insertions(+), 23 deletions(-)
+
+diff --git a/drivers/power/supply/bq25700_charger.c b/drivers/power/supply/bq25700_charger.c
+index a98f10835d68..f2234fc2083c 100644
+--- a/drivers/power/supply/bq25700_charger.c
++++ b/drivers/power/supply/bq25700_charger.c
+@@ -199,6 +199,11 @@ struct bq25700_device {
+ 	int				pd_charge_only;
+ 	unsigned int			bc_event;
+ 	bool				usb_bc;
++	u32				ichg_idx;
++	u32				iin_idx;
++	u32				vindpm_idx;
++	u32				cv_idx;
++	struct delayed_work		charge_poll_work;
+ };
+ 
+ static const struct reg_field bq25700_reg_fields[] = {
+@@ -623,6 +628,80 @@ static int bq25700_field_write(struct bq25700_device *charger,
+ 	return regmap_field_write(charger->rmap_fields[field_id], val);
+ }
+ 
++#define BQ25700_ICHG_LIMIT_IDX	23	/* 1.5 A (23 * 64 mA), gentle charge */
++#define BQ25700_CHARGE_POLL_MS	30000
++
++/*
++ * The SC8886 keeps the charge path latched closed once the pack has reached
++ * CV.  The datasheet reset (CV -> 0 -> target) re-opens it; the same reset
++ * also clears ChargeCurrent, so restore it afterwards.
++ */
++static int bq25700_write_cv(struct bq25700_device *charger, u32 idx)
++{
++	int ret, v;
++
++	ret = bq25700_field_write(charger, MAX_CHARGE_VOLTAGE, 0);
++	if (ret < 0)
++		return ret;
++	usleep_range(3000, 5000);
++
++	ret = bq25700_field_write(charger, MAX_CHARGE_VOLTAGE, idx);
++	if (ret < 0)
++		return ret;
++
++	v = bq25700_field_read(charger, MAX_CHARGE_VOLTAGE);
++	if (v != (int)idx) {
++		bq25700_field_write(charger, MAX_CHARGE_VOLTAGE, 0);
++		usleep_range(3000, 5000);
++		bq25700_field_write(charger, MAX_CHARGE_VOLTAGE, idx);
++	}
++
++	charger->cv_idx = idx;
++	bq25700_field_write(charger, CHARGE_CURRENT, charger->ichg_idx);
++	return 0;
++}
++
++static void bq25700_set_ichg(struct bq25700_device *charger, u32 idx)
++{
++	if (idx > BQ25700_ICHG_LIMIT_IDX)
++		idx = BQ25700_ICHG_LIMIT_IDX;
++	charger->ichg_idx = idx;
++	bq25700_field_write(charger, CHARGE_CURRENT, idx);
++}
++
++static void bq25700_set_iin(struct bq25700_device *charger, u32 idx)
++{
++	charger->iin_idx = idx;
++	bq25700_field_write(charger, INPUT_CURRENT, idx);
++}
++
++static void bq25700_set_vindpm(struct bq25700_device *charger, u32 idx)
++{
++	charger->vindpm_idx = idx;
++	bq25700_field_write(charger, INPUT_VOLTAGE, idx);
++}
++
++static void bq25700_charge_poll_worker(struct work_struct *work)
++{
++	struct bq25700_device *charger =
++		container_of(work, struct bq25700_device, charge_poll_work.work);
++
++	/*
++	 * The chip zeroes ChargeCurrent on adapter removal/replug and reloads
++	 * VINREG on converter restarts; re-apply the limits periodically so
++	 * charging does not stop silently.
++	 */
++	if (bq25700_field_read(charger, AC_STAT) > 0) {
++		bq25700_set_iin(charger, charger->iin_idx);
++		bq25700_set_vindpm(charger, charger->vindpm_idx);
++		bq25700_set_ichg(charger, charger->ichg_idx);
++	}
++	queue_delayed_work(charger->usb_charger_wq,
++			   &charger->charge_poll_work,
++			   msecs_to_jiffies(BQ25700_CHARGE_POLL_MS));
++}
++
++
+ static int bq25700_get_chip_state(struct bq25700_device *charger,
+ 				  struct bq25700_state *state)
+ {
+@@ -872,12 +951,12 @@ void bq25700_charger_set_current(unsigned long event,
+ 	switch (event) {
+ 	case CHARGER_CURRENT_EVENT:
+ 		idx = bq25700_find_idx(current_value, TBL_ICHG);
+-		bq25700_field_write(bq25700_charger, CHARGE_CURRENT, idx);
++		bq25700_set_ichg(bq25700_charger, idx);
+ 		break;
+ 
+ 	case INPUT_CURRENT_EVENT:
+ 		idx = bq25700_find_idx(current_value, TBL_INPUTCUR);
+-		bq25700_field_write(bq25700_charger, INPUT_CURRENT, idx);
++		bq25700_set_iin(bq25700_charger, idx);
+ 		break;
+ 
+ 	default:
+@@ -985,8 +1064,6 @@ static int bq25700_hw_init(struct bq25700_device *charger)
+ 		enum bq25700_fields id;
+ 		u32 value;
+ 	} init_data[] = {
+-		{CHARGE_CURRENT,	 charger->init_data.ichg},
+-		{MAX_CHARGE_VOLTAGE,	 charger->init_data.max_chg_vol},
+ 		{MIN_SYS_VOTAGE,	 charger->init_data.sys_min_voltage},
+ 		{OTG_VOLTAGE,	 charger->init_data.otg_voltage},
+ 		{OTG_CURRENT,	 charger->init_data.otg_current},
+@@ -997,6 +1074,14 @@ static int bq25700_hw_init(struct bq25700_device *charger)
+ 	if (ret < 0)
+ 		return ret;
+ 
++	/* clear stale inhibit / hi-z bits left by a warm reset */
++	bq25700_field_write(charger, CHRG_INHIBIT, 0);
++	bq25700_field_write(charger, EN_HIZ, 0);
++
++	charger->iin_idx = charger->init_data.input_current_sdp;
++	charger->vindpm_idx = bq25700_find_idx(DEFAULT_INPUTVOL, TBL_INPUTVOL);
++	bq25700_set_ichg(charger, charger->init_data.ichg);
++
+ 	/* initialize currents/voltages and other parameters */
+ 	for (i = 0; i < ARRAY_SIZE(init_data); i++) {
+ 		ret = bq25700_field_write(charger, init_data[i].id,
+@@ -1005,6 +1090,11 @@ static int bq25700_hw_init(struct bq25700_device *charger)
+ 			return ret;
+ 	}
+ 
++	/* the SC8886 CV write needs the datasheet latch reset sequence */
++	ret = bq25700_write_cv(charger, charger->init_data.max_chg_vol);
++	if (ret < 0)
++		return ret;
++
+ 	DBG("	 CHARGE_CURRENT: %dmA\n",
+ 	    bq25700_field_read(charger, CHARGE_CURRENT) * 64);
+ 	DBG("MAX_CHARGE_VOLTAGE: %dmV\n",
+@@ -1110,8 +1200,8 @@ static int bq25700_fw_probe(struct bq25700_device *charger)
+ static void bq25700_enable_charger(struct bq25700_device *charger,
+ 				   u32 input_current)
+ {
+-	bq25700_field_write(charger, INPUT_CURRENT, input_current);
+-	bq25700_field_write(charger, CHARGE_CURRENT, charger->init_data.ichg);
++	bq25700_set_iin(charger, input_current);
++	bq25700_set_ichg(charger, charger->init_data.ichg);
+ }
+ 
+ static enum power_supply_property bq25700_power_supply_props[] = {
+@@ -1304,9 +1394,9 @@ static int bq2570x_pd_notifier_call(struct notifier_block *nb,
+ 			return NOTIFY_OK;
+ 		chr_idx = bq25700_find_idx(prop.intval, TBL_ICHG);
+ 
+-		bq25700_field_write(bq, INPUT_CURRENT, cur_idx);
+-		bq25700_field_write(bq, INPUT_VOLTAGE, vol_idx);
+-		bq25700_field_write(bq, CHARGE_CURRENT, chr_idx);
++		bq25700_set_iin(bq, cur_idx);
++		bq25700_set_vindpm(bq, vol_idx);
++		bq25700_set_ichg(bq, chr_idx);
+ 		dev_info(bq->dev, "INPUT_CURRENT:%d, INPUT_VOLTAGE:%d, CHARGE_CURRENT:%d\n",
+ 			 cur_idx, vol_idx, chr_idx);
+ 
+@@ -1325,10 +1415,13 @@ static irqreturn_t bq25700_irq_handler_thread(int irq, void *private)
+ 
+ 	if (bq25700_field_read(charger, AC_STAT)) {
+ 		irq_flag = IRQF_TRIGGER_LOW;
++		/* re-open the charge path and re-apply limits after replug */
++		bq25700_write_cv(charger, charger->cv_idx);
++		bq25700_set_iin(charger, charger->iin_idx);
++		bq25700_set_ichg(charger, charger->ichg_idx);
+ 	} else {
+ 		irq_flag = IRQF_TRIGGER_HIGH;
+-		bq25700_field_write(charger, INPUT_CURRENT,
+-				    charger->init_data.input_current_sdp);
++		bq25700_set_iin(charger, charger->init_data.input_current_sdp);
+ 		bq25700_disable_charge(charger);
+ 		bq25700_get_chip_state(charger, &state);
+ 		charger->state = state;
+@@ -1579,9 +1672,8 @@ static void bq25700_discnt(struct bq25700_device *charger,
+ 		}
+ 
+ 		vol_idx = bq25700_find_idx(DEFAULT_INPUTVOL, TBL_INPUTVOL);
+-		bq25700_field_write(charger, INPUT_VOLTAGE, vol_idx);
+-		bq25700_field_write(charger, INPUT_CURRENT,
+-				    charger->init_data.input_current_sdp);
++		bq25700_set_vindpm(charger, vol_idx);
++		bq25700_set_iin(charger, charger->init_data.input_current_sdp);
+ 		bq25700_get_chip_state(charger, &state);
+ 		charger->state = state;
+ 		power_supply_changed(charger->supply_charger);
+@@ -1720,10 +1812,9 @@ static int bq25700_register_pd_nb(struct bq25700_device *charger)
+ 
+ 		cur_idx = bq25700_find_idx(prop.intval, TBL_INPUTCUR);
+ 		vol_idx = bq25700_find_idx((prop.intval - 1280000 - 3200000), TBL_INPUTVOL);
+-		bq25700_field_write(charger, INPUT_CURRENT, cur_idx);
+-		bq25700_field_write(charger, INPUT_VOLTAGE, vol_idx);
+-		bq25700_field_write(charger, CHARGE_CURRENT,
+-				    charger->init_data.ichg);
++		bq25700_set_iin(charger, cur_idx);
++		bq25700_set_vindpm(charger, vol_idx);
++		bq25700_set_ichg(charger, charger->init_data.ichg);
+ 		dev_info(charger->dev, "INPUT_CURRENT:%d, INPUT_VOLTAGE:%d, CHARGE_CURRENT:%d\n",
+ 				 cur_idx, vol_idx, charger->init_data.ichg);
+ 	}
+@@ -1867,8 +1958,7 @@ static long bq25700_init_usb(struct bq25700_device *charger)
+ 		charger->cable_edev_1 = edev1;
+ 	}
+ 	/*set power_on input current*/
+-	bq25700_field_write(charger, INPUT_CURRENT,
+-			    charger->init_data.input_current_sdp);
++	bq25700_set_iin(charger, charger->init_data.input_current_sdp);
+ 
+ 	if (!charger->pd_charge_only)
+ 		bq25700_register_cg_nb(charger);
+@@ -2081,6 +2171,14 @@ static int bq25700_probe(struct i2c_client *client)
+ 
+ 	bq25700_charger = charger;
+ 
++	if (charger->usb_charger_wq) {
++		INIT_DELAYED_WORK(&charger->charge_poll_work,
++				  bq25700_charge_poll_worker);
++		queue_delayed_work(charger->usb_charger_wq,
++				   &charger->charge_poll_work,
++				   msecs_to_jiffies(BQ25700_CHARGE_POLL_MS));
++	}
++
+ irq_fail:
+ 	return ret;
+ }
+@@ -2091,9 +2189,10 @@ static void bq25700_shutdown(struct i2c_client *client)
+ 	struct bq25700_device *charger = i2c_get_clientdata(client);
+ 
+ 	vol_idx = bq25700_find_idx(DEFAULT_INPUTVOL, TBL_INPUTVOL);
+-	bq25700_field_write(charger, INPUT_VOLTAGE, vol_idx);
+-	bq25700_field_write(charger, INPUT_CURRENT,
+-			    charger->init_data.input_current_sdp);
++	if (charger->usb_charger_wq)
++		cancel_delayed_work_sync(&charger->charge_poll_work);
++	bq25700_set_vindpm(charger, vol_idx);
++	bq25700_set_iin(charger, charger->init_data.input_current_sdp);
+ 
+ 	if (!bq25700_field_read(charger, AC_STAT))
+ 		bq25700_field_write(charger, EN_LWPWR, 1);
+-- 
+2.53.0
+
